@@ -1,4 +1,5 @@
 import os
+import pickle
 import tempfile
 from dataclasses import dataclass
 
@@ -248,5 +249,10 @@ class GeodesicPatcher:
         if cleanup:
             os.remove(["tmp.face", "tmp.pdb", "tmp.vert", "tmp.xyzr"])
         return protein_patches
+
+
+    def save_patches(self, path):
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
 
 
