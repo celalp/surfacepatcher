@@ -1,0 +1,17 @@
+name: surfacepatcher
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - cuda-toolkit
+  - python=3.12
+  - msms
+  - pdb2pqr
+  - pip:
+      - torch
+      - scipy
+      - networkx
+      - numpy
+      - open3d
+      - mdtraj
