@@ -19,23 +19,14 @@ class ProteinPatches:
 
 
 class GeodesicPatcher:
-    def __init__(self, pdb_file,  chain_id=None):
-        """
-        Getting things setup for calculations, the main calculation is the __call methodd
-        :param pdb_file: pdb file
-        :param chain_id: if there are multiple chains which one to use.
-        """
-        self.pdb_file = pdb_file
-        self.chain_id = chain_id
-
-    def surface(self):
+    def surface(self, pdb_file, chain_id=None):
         """
         takes a pdb file, runs pdb2pqr then msms
         :return: md.trajectory, vertices, faces, face normals and atom ids
         """
         # 1. Load protein and select chain
-        traj = md.load(self.pdb_file)
-        if self.chain_id:
+        traj = md.load(pdb_file)
+        if chain_id:
             traj = traj.atom_slice(traj.topology.select(f"chainid == {self.chain_id}")) #TODO Change to expression
 
         vertices, faces, normals, atom_ids = compute_msms_surface(traj.xyz[0], traj)
