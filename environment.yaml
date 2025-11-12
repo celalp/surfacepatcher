@@ -8,6 +8,7 @@ dependencies:
   - python=3.12
   - msms
   - pdb2pqr
+  - pip
   - pip:
       - torch
       - scipy

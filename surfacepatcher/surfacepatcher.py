@@ -217,7 +217,7 @@ class GeodesicPatcher:
 
         return residues
 
-    def __call__(self, radius_angstrom=25, M=25, K=5, cleanup=True):
+    def __call__(self, pdb_file, chain_id, radius_angstrom=25, M=25, K=5, cleanup=True):
         """
         for a given pdb and chain calculate the pathches
         :param radius_angstrom: the radius of the patch
@@ -226,7 +226,7 @@ class GeodesicPatcher:
         that are less than an atom (we could if you think about electron clouds but we are dealing with meshes)
         :return: ProteinPatches dataclass
         """
-        traj, vertices, faces, normals, atoms = self.surface()
+        traj, vertices, faces, normals, atoms = self.surface(pdb_file, chain_id)
         properties = self.vertex_properties(traj, vertices, faces)
         patches, dist_matrix =self.extract_geodesic_patches(vertices, faces, radius_angstrom, properties, traj, atoms)
         descriptors=self.compute_detailed_patch_descriptors(patches, vertices, dist_matrix,
