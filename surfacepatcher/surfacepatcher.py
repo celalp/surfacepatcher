@@ -185,8 +185,9 @@ class GeodesicPatcher:
 
             descriptor[descriptor==np.inf]=0
             descriptor[np.isnan(descriptor)] = 0
-            descriptor=torch.tensor(descriptor)
-            descriptor = descriptor.unsqueeze(1).expand(M, M, K, 6)
+            descriptor = torch.tensor(descriptor).float()
+            # Generate M rotations by rolling along the angular dimension
+            descriptor = torch.stack([torch.roll(descriptor, shifts=i, dims=0) for i in range(M)])
             detailed_descriptors[center_idx] = descriptor
 
         return detailed_descriptors
@@ -231,19 +232,21 @@ class GeodesicPatcher:
         patches, dist_matrix =self.extract_geodesic_patches(vertices, faces, radius_angstrom, properties, traj, atoms)
         descriptors=self.compute_detailed_patch_descriptors(patches, vertices, dist_matrix,
                                                             normals, radius_angstrom, M, K)
-        protein_patches=ProteinPatches(pdb_file=self.pdb_file,
+        protein_patches=ProteinPatches(pdb_file=pdb_file,
                                        radius_angstrom=radius_angstrom,
                                        sampling_angle=360/M,
                                        num_points=K,
                                        patches=patches,
                                        descriptors=descriptors)
         if cleanup:
-            os.remove(["tmp.face", "tmp.pdb", "tmp.vert", "tmp.xyzr"])
+            items=["tmp.face", "tmp.pdb", "tmp.vert", "tmp.xyzr"]
+            for item in items:
+                os.remove(item)
         return protein_patches
 
 
-    def save_patches(self, path):
+    def save_patches(self, patches, path):
         with open(path, 'wb') as f:
-            pickle.dump(self, f)
+            pickle.dump(patches, f)
 
 
