@@ -1,8 +1,0 @@
-numpy>=1.20.0
-scipy>=1.7.0
-mdtraj>=1.9.7
-open3d>=0.18.0
-giotto-tda>=0.6.0
-scikit-learn>=1.0.0
-tqdm>=4.62.0
-torch>=1.10.0

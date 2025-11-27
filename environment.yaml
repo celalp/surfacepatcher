@@ -16,3 +16,7 @@ dependencies:
       - numpy
       - open3d
       - mdtraj
+      - giotto-tda
+      - scikit-learn
+      - tqdm
+      
