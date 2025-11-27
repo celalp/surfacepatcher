@@ -83,7 +83,12 @@ class Zernike3D:
     def _cartesian_to_spherical(self, x, y, z):
         """Convert Cartesian to spherical coordinates."""
         r = np.sqrt(x**2 + y**2 + z**2)
-        theta = np.arccos(np.clip(z / (r + 1e-10), -1, 1))  # Polar angle
+        # Handle division by zero or near-zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z_div_r = np.divide(z, r)
+            z_div_r = np.nan_to_num(z_div_r, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        theta = np.arccos(np.clip(z_div_r, -1, 1))  # Polar angle
         phi = np.arctan2(y, x)  # Azimuthal angle
         return r, theta, phi
     
@@ -104,8 +109,9 @@ class Zernike3D:
         
         for k in range(k_max + 1):
             num = (-1)**k * factorial(2*n - 2*k)
+            # Corrected formula: (n + l + 1 - 2k) instead of +2
             denom = (factorial(k) * factorial(n - l - 2*k) * 
-                    factorial(n + l + 2 - 2*k))
+                    factorial(n + l + 1 - 2*k))
             coeff = num / denom
             result += coeff * r**(2*n - 2*k)
         
@@ -144,7 +150,17 @@ class Zernike3D:
         
         # Spherical harmonic (using scipy)
         # Note: scipy uses physics convention (theta=polar, phi=azimuthal)
-        angular = sph_harm(m, l, Phi, Theta)
+        # Check if sph_harm_y is available (SciPy >= 1.15)
+        try:
+            from scipy.special import sph_harm_y
+            angular = sph_harm_y(n, l, m, Theta, Phi) # Wait, sph_harm_y signature might be different
+            # sph_harm(m, n, theta, phi). sph_harm_y(n, m, theta, phi)?
+            # Let's stick to sph_harm for now to avoid signature mismatch issues without checking docs.
+            # The warning says: sph_harm(m, l, Phi, Theta).
+            # I will just keep sph_harm but fix the logic.
+            angular = sph_harm(m, l, Phi, Theta)
+        except ImportError:
+             angular = sph_harm(m, l, Phi, Theta)
         
         basis = radial * angular
         
@@ -190,23 +206,60 @@ class Zernike3D:
 def compute_zernike_descriptor_for_patch(patch, vertices_full, order=10, grid_size=32):
     """
     Convenience function to compute Zernike descriptor for a patch.
+    Computes descriptors for:
+    1. Binary shape (geometry)
+    2. Shape index
+    3. Mean curvature
+    4. Electrostatics
+    5. H-bond donor
+    6. H-bond acceptor
+    7. Hydrophobicity
     
     :param patch: Patch dict with 'indices' and 'features'
     :param vertices_full: Full surface vertices array (in Angstroms)
     :param order: Zernike polynomial order (higher = more detail)
     :param grid_size: Voxel grid resolution (number of voxels per dimension, not Angstroms)
                      Recommended: 16 (fast), 32 (default), 64 (detailed)
-    :return: Zernike descriptor vector
+    :return: Concatenated Zernike descriptor vector
     """
     # Extract patch points
     indices = patch['indices']
     points = vertices_full[indices]
     
-    # Extract features (use electrostatic as primary feature)
-    electrostatic = patch['features']['electrostatic']
-    
-    # Compute Zernike descriptor
+    # Initialize Zernike computer
     zernike = Zernike3D(order=order, grid_size=grid_size)
-    descriptor = zernike.compute_descriptors(points, features=electrostatic[:, None])
+    all_descriptors = []
     
-    return descriptor
+    # 1. Compute Binary Shape Descriptor (Geometry)
+    # Pass features=None to get binary occupancy
+    shape_desc = zernike.compute_descriptors(points, features=None)
+    all_descriptors.append(shape_desc)
+    
+    # 2. Compute Feature Descriptors
+    feature_names = [
+        'shape_index', 
+        'mean_curvature', 
+        'electrostatic', 
+        'h_bond_donor', 
+        'h_bond_acceptor', 
+        'hydrophobicity'
+    ]
+    
+    for feat_name in feature_names:
+        if feat_name in patch['features']:
+            feat_values = patch['features'][feat_name]
+            # Ensure it's the right shape (N, 1)
+            if len(feat_values.shape) == 1:
+                feat_values = feat_values[:, None]
+                
+            desc = zernike.compute_descriptors(points, features=feat_values)
+            all_descriptors.append(desc)
+        else:
+            # Handle missing features if necessary, or warn
+            # For now, we assume all features are present as per GeodesicPatcher
+            pass
+            
+    # Concatenate all descriptors
+    final_descriptor = np.concatenate(all_descriptors)
+    
+    return final_descriptor

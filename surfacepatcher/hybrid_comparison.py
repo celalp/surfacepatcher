@@ -221,30 +221,6 @@ class HybridComparison:
             matches.append((keys1[i], keys2[j], distances[i, j]))
         
         return matches
+
+    #TODO add pickling
     
-    def print_summary(self):
-        """Print a summary of the hybrid comparison."""
-        print("=" * 70)
-        print("Hybrid Surface Comparison Summary")
-        print("=" * 70)
-        
-        print("\nAvailable Methods:")
-        if self.geodesic_results is not None:
-            print(f"  ✓ Geodesic (weight: {self.weights['geodesic']:.2f})")
-        if self.pointcloud_results is not None:
-            print(f"  ✓ Point Cloud (weight: {self.weights['pointcloud']:.2f})")
-        if self.topological_results is not None:
-            print(f"  ✓ Topological (weight: {self.weights['topological']:.2f})")
-        
-        print(f"\nFusion Method: {self.fusion_method}")
-        
-        # Method agreement
-        if sum([self.geodesic_results is not None, 
-                self.pointcloud_results is not None,
-                self.topological_results is not None]) > 1:
-            print("\nMethod Agreement (Correlation):")
-            correlations = self.get_method_agreement()
-            for pair, corr in correlations.items():
-                print(f"  {pair}: {corr:.3f}")
-        
-        print("=" * 70)

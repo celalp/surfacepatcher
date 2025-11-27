@@ -4,7 +4,7 @@ import open3d as o3d
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import chi2_kernel
-from geodesic_patcher.surface_utils import SurfaceCache
+from surfacepatcher.surface_utils import SurfaceCache
 
 
 class PointCloudComparison:
