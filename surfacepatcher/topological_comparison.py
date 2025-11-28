@@ -5,9 +5,8 @@ from scipy.spatial.distance import cdist
 from surfacepatcher.surface_utils import SurfaceCache
 
 from gtda.homology import VietorisRipsPersistence
-from gtda.diagrams import PersistenceEntropy, Amplitude, NumberOfPoints
-from gtda.diagrams import PersistenceImage, PersistenceLandscape
-from gtda.diagrams import Scaler
+from gtda.diagrams import PersistenceEntropy, Amplitude, NumberOfPoints, PairwiseDistance
+
 
 class TopologicalComparison:
     def __init__(self, patches1, patches2, homology_dimensions=(0, 1, 2),
@@ -80,7 +79,8 @@ class TopologicalComparison:
         diagrams = self.vr_persistence.fit_transform(points_batch)
         
         return diagrams[0]  # Return single diagram
-    
+
+    #TODO this is not done, need to implement proper feature-based filtration
     def _compute_feature_weighted_persistence(self, points, feature_values, feature_name):
         """
         Compute persistence using a feature as the filtration function.
@@ -99,18 +99,26 @@ class TopologicalComparison:
         
         # Feature distance matrix
         feat_dists = np.abs(feat_norm[:, None] - feat_norm[None, :])
-        
+
         # Combined distance: geometric + feature
         # Weight feature contribution
         combined_dists = geom_dists + 2.0 * feat_dists
         
-        # Use lower-star filtration on feature values
-        # This is a simplified approach; for true sublevel set persistence,
-        # we'd need a different filtration
+        # Use precomputed distance matrix for filtration
+        # We need a new instance because the main one is configured for point clouds (metric='euclidean')
+        vr_precomputed = VietorisRipsPersistence(
+            metric='precomputed',
+            homology_dimensions=self.homology_dimensions,
+            max_edge_length=np.max(combined_dists), # Ensure we cover the whole range if needed, or keep self.max_edge_length
+            n_jobs=1 # Parallelism handled at outer loop if any, or keep 1 for inner
+        )
         
-        # For now, return standard geometric persistence
-        # TODO: Implement proper feature-based filtration
-        return self._compute_persistence_diagram(points)
+        # Reshape for gtda: (1, N, N)
+        dists_batch = combined_dists[np.newaxis, :, :]
+        
+        diagrams = vr_precomputed.fit_transform(dists_batch)
+        
+        return diagrams[0]
     
     def _vectorize_persistence_diagram(self, diagram):
         """
@@ -129,16 +137,13 @@ class TopologicalComparison:
         entropy_computer = PersistenceEntropy()
         entropy = entropy_computer.fit_transform(diagram_batch)
         features.append(entropy.flatten())
-        
+
         # 2. Amplitude (various norms)
-        for metric in ['bottleneck', 'wasserstein', 'landscape', 'betti', 'heat']:
-            try:
-                amp_computer = Amplitude(metric=metric)
-                amplitude = amp_computer.fit_transform(diagram_batch)
-                features.append(amplitude.flatten())
-            except:
-                # Some metrics might not be available
-                pass
+        # Use specific, robust metrics
+        for metric in ['bottleneck', 'wasserstein', 'landscape']:
+            amp_computer = Amplitude(metric=metric)
+            amplitude = amp_computer.fit_transform(diagram_batch)
+            features.append(amplitude.flatten())
         
         # 3. Number of points in each homology dimension
         n_points_computer = NumberOfPoints()
@@ -210,15 +215,77 @@ class TopologicalComparison:
         )
         features_hydro = self._vectorize_persistence_diagram(diagram_hydro)
         
+        # 4. Feature-weighted persistence (hbond donor)
+        hbond_donor = patch['features'].get('hbond_donor', np.zeros(len(points)))
+        diagram_hbond_donor = self._compute_feature_weighted_persistence(
+            points, hbond_donor, 'hbond_donor'
+        )
+        features_hbond_donor = self._vectorize_persistence_diagram(diagram_hbond_donor)
+
+        # 5. Feature-weighted persistence (hbond acceptor)
+        hbond_acceptor = patch['features'].get('hbond_acceptor', np.zeros(len(points)))
+        diagram_hbond_acceptor = self._compute_feature_weighted_persistence(
+            points, hbond_acceptor, 'hbond_acceptor'
+        )
+        features_hbond_acceptor = self._vectorize_persistence_diagram(diagram_hbond_acceptor)
+        
         # Concatenate all topological features
         combined_features = np.concatenate([
             features_geom,
             features_elec,
-            features_hydro
+            features_hydro,
+            features_hbond_donor,
+            features_hbond_acceptor
         ])
         
         return combined_features
-    
+
+    def _get_patch_diagrams(self, patch, vertices_full):
+        """
+        Get persistence diagrams for a patch (Geometric, Electrostatic, Hydrophobic).
+        
+        :param patch: Patch dict
+        :param vertices_full: Full surface vertices array
+        :return: List of diagrams [geom, elec, hydro] or None if invalid
+        """
+        points = self._get_patch_points(patch, vertices_full)
+        
+        if len(points) < 4:
+            return None
+            
+        # 1. Standard geometric persistence
+        diagram_geom = self._compute_persistence_diagram(points)
+        
+        if not self.use_feature_filtration:
+            return [diagram_geom]
+        
+        # 2. Feature-weighted persistence (electrostatic)
+        electrostatic = patch['features']['electrostatic']
+        diagram_elec = self._compute_feature_weighted_persistence(
+            points, electrostatic, 'electrostatic'
+        )
+        
+        # 3. Feature-weighted persistence (hydrophobicity)
+        hydrophobic = patch['features']['hydrophobicity']
+        diagram_hydro = self._compute_feature_weighted_persistence(
+            points, hydrophobic, 'hydrophobicity'
+        )
+        
+        # 4. Feature-weighted persistence (hbond donor)
+        hbond_donor = patch['features'].get('hbond_donor', np.zeros(len(points)))
+        diagram_hbond_donor = self._compute_feature_weighted_persistence(
+            points, hbond_donor, 'hbond_donor'
+        )
+
+        # 5. Feature-weighted persistence (hbond acceptor)
+        hbond_acceptor = patch['features'].get('hbond_acceptor', np.zeros(len(points)))
+        diagram_hbond_acceptor = self._compute_feature_weighted_persistence(
+            points, hbond_acceptor, 'hbond_acceptor'
+        )
+        
+        return [diagram_geom, diagram_elec, diagram_hydro, diagram_hbond_donor, diagram_hbond_acceptor]
+
+    #TODO no wasserstein distance implemented yet
     def compute(self, distance_metric='euclidean'):
         """
         Compute pairwise distances between patches using topological descriptors.
@@ -254,6 +321,111 @@ class TopologicalComparison:
             distances = cdist(descriptors1, descriptors2, metric='euclidean')
         elif distance_metric == 'cosine':
             distances = cdist(descriptors1, descriptors2, metric='cosine')
+        elif distance_metric == 'wasserstein':
+            # For Wasserstein, we need to re-compute or store diagrams instead of vectors
+            # Since the current flow computes vectors, we'll need to fetch diagrams here
+            # This is a bit inefficient if we already computed vectors, but cleaner for separation
+            print("Re-computing diagrams for Wasserstein distance...")
+            
+            # Helper to get all diagrams for a set of patches
+            def get_all_diagrams(patches_obj, vertices):
+                all_diagrams = [] # List of lists of diagrams
+                valid_indices = []
+                keys = sorted(list(patches_obj.patches.keys()))
+                for i, key in enumerate(tqdm(keys)):
+                    patch = patches_obj.patches[key]
+                    diagrams = self._get_patch_diagrams(patch, vertices)
+                    if diagrams is not None:
+                        all_diagrams.append(diagrams)
+                        valid_indices.append(i)
+                    else:
+                        # Handle empty/invalid patches by appending empty diagrams or skipping
+                        # For simplicity, we'll append dummy empty diagrams (0 points)
+                        # But gtda might complain. Let's use a placeholder with one point at (0,0,0) which has 0 persistence
+                        # Actually, let's just skip and fill distance with infinity later?
+                        # Better: use a dummy diagram with 0 persistence
+                        dummy = np.array([[0, 0, 0]]) 
+                        all_diagrams.append([dummy] * (5 if self.use_feature_filtration else 1))
+                        valid_indices.append(i)
+                return all_diagrams, keys
+
+            diags1_list, keys1 = get_all_diagrams(self.patches1, self.vertices1)
+            diags2_list, keys2 = get_all_diagrams(self.patches2, self.vertices2)
+            
+            n1 = len(diags1_list)
+            n2 = len(diags2_list)
+            distances = np.zeros((n1, n2))
+            
+            # Initialize PairwiseDistance
+            pd_computer = PairwiseDistance(metric='wasserstein', n_jobs=-1)
+            
+            # We have up to 5 types of diagrams per patch. 
+            # We compute distance for each type and sum them.
+            num_types = len(diags1_list[0])
+            
+            for t in range(num_types):
+                # Extract diagrams of type t
+                d1 = [d[t] for d in diags1_list]
+                d2 = [d[t] for d in diags2_list]
+                
+                # Pad diagrams to same size PER DIMENSION
+                # 1. Find max points per dimension
+                max_points_per_dim = {}
+                all_diags = d1 + d2
+                
+                # Get all unique dimensions present
+                unique_dims = set()
+                for d in all_diags:
+                    if len(d) > 0:
+                        unique_dims.update(np.unique(d[:, 2]))
+                
+                for dim in unique_dims:
+                    max_count = 0
+                    for d in all_diags:
+                        count = np.sum(d[:, 2] == dim)
+                        if count > max_count:
+                            max_count = count
+                    max_points_per_dim[dim] = max_count
+                
+                # 2. Pad each diagram
+                def pad_per_dim(diags, max_counts):
+                    padded_diags = []
+                    for d in diags:
+                        parts = []
+                        for dim, max_n in max_counts.items():
+                            # Extract points for this dim
+                            if len(d) > 0:
+                                mask = d[:, 2] == dim
+                                points = d[mask]
+                            else:
+                                points = np.zeros((0, 3))
+                            
+                            current_n = len(points)
+                            if current_n < max_n:
+                                # Pad with (0, 0, dim)
+                                padding = np.zeros((max_n - current_n, 3))
+                                padding[:, 2] = dim
+                                points = np.vstack([points, padding]) if len(points) > 0 else padding
+                            parts.append(points)
+                        
+                        # Combine parts
+                        if parts:
+                            padded_d = np.vstack(parts)
+                        else:
+                            # Should not happen if max_counts is not empty
+                            padded_d = np.zeros((0, 3))
+                        padded_diags.append(padded_d)
+                    return padded_diags
+
+                d1_padded = pad_per_dim(d1, max_points_per_dim)
+                d2_padded = pad_per_dim(d2, max_points_per_dim)
+                
+                # fit(X) -> transform(Y) computes dist(X, Y)
+                pd_computer.fit(d1_padded)
+                dists_t = pd_computer.transform(d2_padded)
+                
+                distances += dists_t
+                
         else:
             raise ValueError(f"Unknown distance_metric: {distance_metric}")
         

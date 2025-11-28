@@ -17,7 +17,8 @@ class PatchComparison:
         self.patches1 = patches1
         self.patches2 = patches2
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
+        #TODO need to get the weights from the static method
         # Set feature weights
         if feature_weights is not None:
             self.feature_weights = torch.tensor(feature_weights, dtype=torch.float32)

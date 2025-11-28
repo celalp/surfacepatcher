@@ -40,19 +40,13 @@ class GeodesicPatcher:
         """
         properties = {}
 
-        # 1. **SHAPE**: Local curvature (mean + Gaussian)
         curvature, shape_index = compute_curvature(vertices, faces)
         properties['shape_index'] = shape_index  # -1(convex) to +1(concave)
         properties['mean_curvature'] = curvature
 
-        # 2. **ELECTROSTATICS**: Project atomic charges to surface
         properties['electrostatic'] = project_electrostatics(traj, vertices)
-
-        # 3. **H-BOND PROPENSITY**: Donor/acceptor density
         properties['h_bond_donor'] = project_hbond_propensity(traj, vertices, 'donor')
         properties['h_bond_acceptor'] = project_hbond_propensity(traj, vertices, 'acceptor')
-
-        # 4. **HYDROPHOBICITY**: Weighted average from nearby residues
         properties['hydrophobicity'] = project_hydrophobicity(traj, vertices)
 
         return properties

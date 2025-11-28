@@ -3,7 +3,6 @@ import numpy as np
 import open3d as o3d
 from tqdm import tqdm
 from scipy.spatial.distance import cdist
-from sklearn.metrics.pairwise import chi2_kernel
 from surfacepatcher.surface_utils import SurfaceCache
 
 
