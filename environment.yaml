@@ -5,7 +5,7 @@ channels:
   - defaults
 dependencies:
   - cuda-toolkit
-  - python=3.12
+  - python=3.11
   - msms
   - pdb2pqr
   - pip
@@ -13,6 +13,10 @@ dependencies:
       - torch
       - scipy
       - networkx
-      - numpy
+      - numpy==1.26.4
       - open3d
       - mdtraj
+      - giotto-tda
+      - scikit-learn
+      - tqdm
+      

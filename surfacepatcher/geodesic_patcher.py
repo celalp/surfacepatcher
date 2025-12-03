@@ -1,6 +1,5 @@
 import os
 import pickle
-import tempfile
 from dataclasses import dataclass
 
 import torch
@@ -26,8 +25,8 @@ class GeodesicPatcher:
         """
         # 1. Load protein and select chain
         traj = md.load(pdb_file)
-        if chain_id:
-            traj = traj.atom_slice(traj.topology.select(f"chainid == {self.chain_id}")) #TODO Change to expression
+        if chain_id is not None:
+            traj = traj.atom_slice(traj.topology.select(f"chainid == {chain_id}"))
 
         vertices, faces, normals, atom_ids = compute_msms_surface(traj.xyz[0], traj)
         return traj, vertices, faces, normals, atom_ids
@@ -40,19 +39,13 @@ class GeodesicPatcher:
         """
         properties = {}
 
-        # 1. **SHAPE**: Local curvature (mean + Gaussian)
         curvature, shape_index = compute_curvature(vertices, faces)
         properties['shape_index'] = shape_index  # -1(convex) to +1(concave)
         properties['mean_curvature'] = curvature
 
-        # 2. **ELECTROSTATICS**: Project atomic charges to surface
         properties['electrostatic'] = project_electrostatics(traj, vertices)
-
-        # 3. **H-BOND PROPENSITY**: Donor/acceptor density
         properties['h_bond_donor'] = project_hbond_propensity(traj, vertices, 'donor')
         properties['h_bond_acceptor'] = project_hbond_propensity(traj, vertices, 'acceptor')
-
-        # 4. **HYDROPHOBICITY**: Weighted average from nearby residues
         properties['hydrophobicity'] = project_hydrophobicity(traj, vertices)
 
         return properties
@@ -98,7 +91,6 @@ class GeodesicPatcher:
 
         return patches, dist_matrix
 
-
     def compute_detailed_patch_descriptors(self, patches, vertices, dist_matrix, normals, radius, M=36, K=5) -> torch.Tensor:
         """
         compute radial descriptors, starting form the center of the patch move to the diameter with M interval so 36 means
@@ -120,7 +112,13 @@ class GeodesicPatcher:
             center_normal = normals[center_idx]
 
             patch_indices = patch['indices']
-            if len(patch_indices) < 360/M:  # Skip small patches
+            
+            # Initialize zero descriptor for degenerate cases
+            # Shape: (M, M, K, P) - M rotations of (M, K, P) descriptor
+            zero_descriptor = torch.zeros((M, M, K, P)).float()
+            
+            if len(patch_indices) < 360/M:  # Too small patches
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
 
             local_indices = np.arange(len(patch_indices))  # 0 to len-1 for local
@@ -131,18 +129,40 @@ class GeodesicPatcher:
             proj_vecs = vecs - np.outer(np.dot(vecs, center_normal), center_normal)
             proj_norms = np.linalg.norm(proj_vecs, axis=1)
 
-            mask = proj_norms > 1e-6  # Avoid zero
+            # Use more robust epsilon for numerical stability
+            epsilon_norm = 1e-8
+            mask = proj_norms > epsilon_norm  # Avoid zero
+            
+            # Check if we have enough valid projected vectors
+            if np.sum(mask) < 2:
+                detailed_descriptors[center_idx] = zero_descriptor
+                continue  # Skip patches with insufficient tangent plane data
+            
             unit_proj = np.zeros_like(proj_vecs)
             unit_proj[mask] = proj_vecs[mask] / proj_norms[mask, None]
 
             # Choose reference direction u0: closest neighbor
-            nonzero_local = local_indices[mask & (patch_dists > 0)]
+            nonzero_local = local_indices[mask & (patch_dists > epsilon_norm)]
             if len(nonzero_local) == 0:
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
+
             closest_local = nonzero_local[np.argmin(patch_dists[nonzero_local])]
             u0 = unit_proj[closest_local]
+            
+            # Ensure u0 is normalized
+            u0_norm = np.linalg.norm(u0)
+            if u0_norm < epsilon_norm:
+                detailed_descriptors[center_idx] = zero_descriptor
+                continue
+            u0 = u0 / u0_norm
+            
             v0 = np.cross(center_normal, u0)
-            v0 /= np.linalg.norm(v0)
+            v0_norm = np.linalg.norm(v0)
+            if v0_norm < epsilon_norm:
+                detailed_descriptors[center_idx] = zero_descriptor
+                continue
+            v0 = v0 / v0_norm
 
             # Compute angles
             dot_u = np.dot(unit_proj, u0)
@@ -177,14 +197,37 @@ class GeodesicPatcher:
                     bin_prop = patch['features'][prop][bin_local]
                     sorted_prop = bin_prop[sort_idx]
 
-                    # Interpolate with extrapolation
-                    interp_func = interp1d(sorted_d, sorted_prop, kind='linear', fill_value='extrapolate')
+                    # Robust interpolation with boundary handling instead of extrapolation
+                    # Check if we have valid data range
+                    if len(sorted_d) < 2 or sorted_d[-1] - sorted_d[0] < 1e-8:
+                        # Insufficient range, use mean value
+                        descriptor[i, :, p] = np.mean(sorted_prop)
+                        continue
+                    
+                    # Use bounds_error=False with fill_value for safer interpolation
+                    # Fill values outside range with boundary values instead of extrapolating
+                    interp_func = interp1d(
+                        sorted_d, 
+                        sorted_prop, 
+                        kind='linear', 
+                        bounds_error=False,
+                        fill_value=(sorted_prop[0], sorted_prop[-1])
+                    )
                     sampled_prop = interp_func(sample_d)
+                    
+                    # Additional safety: clamp to reasonable range based on input data
+                    prop_min, prop_max = np.min(sorted_prop), np.max(sorted_prop)
+                    prop_range = prop_max - prop_min
+                    if prop_range > 1e-8:
+                        # Allow 10% extrapolation beyond observed range
+                        safe_min = prop_min - 0.1 * prop_range
+                        safe_max = prop_max + 0.1 * prop_range
+                        sampled_prop = np.clip(sampled_prop, safe_min, safe_max)
 
                     descriptor[i, :, p] = sampled_prop
 
-            descriptor[descriptor==np.inf]=0
-            descriptor[np.isnan(descriptor)] = 0
+            # Final safety checks for any remaining numerical issues
+            descriptor = np.nan_to_num(descriptor, nan=0.0, posinf=0.0, neginf=0.0)
             descriptor = torch.tensor(descriptor).float()
             # Generate M rotations by rolling along the angular dimension
             descriptor = torch.stack([torch.roll(descriptor, shifts=i, dims=0) for i in range(M)])

@@ -16,8 +16,43 @@ hydro_scale = {
     'THR': -0.7, 'TRP': -0.9, 'TYR': -1.3, 'VAL': 4.2
 }
 
+presets = {
+            'epitope': [
+                2.0,  # shape_index - critical for antibody binding
+                1.5,  # mean_curvature
+                2.0,  # electrostatic - critical for antibody binding
+                1.8,  # h_bond_donor
+                1.8,  # h_bond_acceptor
+                1.2   # hydrophobicity
+            ],
+            'general': [
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0  # All equal
+            ],
+            'enzyme': [
+                1.5,  # shape_index - pocket shape important
+                1.3,  # mean_curvature
+                1.8,  # electrostatic - catalytic residues often charged
+                2.0,  # h_bond_donor - critical for catalysis
+                2.0,  # h_bond_acceptor - critical for catalysis
+                1.4   # hydrophobicity - substrate binding
+            ],
+            'interface': [
+                2.0,  # shape_index - complementarity critical
+                1.8,  # mean_curvature
+                1.5,  # electrostatic - important but variable
+                1.6,  # h_bond_donor
+                1.6,  # h_bond_acceptor
+                1.7   # hydrophobicity - important for interfaces
+            ]
+}
+
 def compute_msms_surface(coords, traj):
-    """Interface to MSMS for surface mesh"""
+    """
+    Compute molecular surface using MSMS and return vertices, faces, normals, and atom IDs.
+    :param coords: (N, 3) array of atomic coordinates
+    :param traj: mdtraj.Trajectory object with topology information
+    :return: vertices (M, 3), faces (K, 3), normals (M, 3), atom_ids (M,)
+    """
     # Write temporary PDB for MSMS
     tmp_pdb = "tmp.pdb"
     tmp_traj = md.Trajectory(coords, traj.top)
@@ -52,7 +87,12 @@ def compute_msms_surface(coords, traj):
 
 
 def project_electrostatics(traj, vertices):
-    """Project approximate electrostatic potential to surface vertices using simple Coulomb summation from charged atoms."""
+    """Project approximate electrostatic potential to surface vertices using simple
+    Coulomb summation from charged atoms. The inputs are from compute_msms_surface method
+    :param traj: mdtraj.Trajectory object
+    :param vertices: (M, 3) array of surface vertex coordinates
+    :return: (M,) array of electrostatic potential at each vertex
+    """
     topology = traj.top
     atom_pos = traj.xyz[0]  # Assuming single frame
 
@@ -83,7 +123,7 @@ def project_electrostatics(traj, vertices):
                 if atom.name in sidechain_atoms:
                     charged_atoms.append(atom.index)
                     charges.append(total_charge / len(sidechain_atoms))
-        # Note: Ignoring HIS, other titratable groups for simplicity
+        # Ignoring HIS, other titratable groups for simplicity
 
     if not charged_atoms:
         return np.zeros(len(vertices))  # No charges, zero potential
@@ -95,13 +135,21 @@ def project_electrostatics(traj, vertices):
     dists = cdist(vertices, charged_pos)
 
     # Coulomb potential: sum (q / r), with epsilon to avoid division by zero
-    epsilon = 1e-6
+    epsilon = 1e-3  # Increased epsilon for more stability
     potentials = np.sum(charges / (dists + epsilon), axis=1)
+    # Clamp extreme electrostatic values, it is unlikely to have very high potentials we are
+    # selecting relatively small patches here
+    potentials = np.clip(potentials, -10, 10)
 
     return potentials
 
-def project_hbond_propensity(traj, vertices, mode):
-    """Project H-bond donor or acceptor propensity as density to surface vertices using Gaussian kernel."""
+def project_hbond_propensity(traj, vertices, mode, sigma=2.0):
+    """Project H-bond donor or acceptor propensity as density to surface vertices using Gaussian kernel.
+    :param traj: mdtraj.Trajectory object
+    :param vertices: (M, 3) array of surface vertex coordinates
+    :param mode: 'donor' or 'acceptor'
+    :return: (M,) array of H-bond propensity at each vertex
+    """
     topology = traj.top
     atom_pos = traj.xyz[0]
 
@@ -123,11 +171,8 @@ def project_hbond_propensity(traj, vertices, mode):
 
     hb_pos = atom_pos[hb_atoms]
 
-    # Compute distances
+    # Compute distances, this is euclidian but that's fine because we are dealing with close vertices in the mesh/graph
     dists = cdist(vertices, hb_pos)
-
-    # Gaussian kernel for density (sigma=2.0 Å, adjustable)
-    sigma = 2.0
     weights = np.exp(-dists ** 2 / (2 * sigma ** 2))
 
     # Propensity as summed density
@@ -140,7 +185,11 @@ def project_hbond_propensity(traj, vertices, mode):
     return propensity
 
 def project_hydrophobicity(traj, vertices):
-    """Project hydrophobicity to surface vertices using inverse distance weighting from residue scales."""
+    """Project hydrophobicity to surface vertices using inverse distance weighting from residue scales.
+    :param traj: mdtraj.Trajectory object
+    :param vertices: (M, 3) array of surface vertex coordinates
+    :return: (M,) array of hydrophobicity at each vertex
+    """
     topology = traj.top
     atom_pos = traj.xyz[0]
 
@@ -160,8 +209,6 @@ def project_hydrophobicity(traj, vertices):
     return hydro_vert
 
 
-
-
 # Helper functions for curvature and geodesic
 def triangle_area(p0, p1, p2):
     """Return area of a triangle given three points."""
@@ -178,15 +225,21 @@ def cotangent_weight(p0, p1, p2):
     c = np.linalg.norm(p0 - p1)
     # cot(alpha) = (b^2 + c^2 - a^2) / (4 * area)
     area = triangle_area(p0, p1, p2)
-    if area == 0:
+    # Use robust epsilon to avoid division by zero
+    epsilon = 1e-8
+    if area < epsilon:
         return 0.0
-    return (b ** 2 + c ** 2 - a ** 2) / (4 * area)
-
+    cot = (b ** 2 + c ** 2 - a ** 2) / (4 * area)
+    # Clamp extreme values to prevent inf propagation
+    return np.clip(cot, -1e6, 1e6)
 
 def compute_curvature(vertices, faces):
     """
     Compute mean curvature and shape index for each vertex on the mesh.
     Returns dict with 'mean_curvature': (N,) signed mean H, 'shape_index': (N,) in [-1,1]
+    :param vertices: (N, 3) array of vertex positions
+    :param faces: (M, 3) array of triangle vertex indices
+    :return: mean_curvature (N,), shape_index (N,)
     """
     V = vertices
     F = faces
@@ -242,18 +295,23 @@ def compute_curvature(vertices, faces):
 
     L = L.tocsr()
 
-    # Mass matrix inverse
-    Minv = diags(1.0 / (2 * A + 1e-10), 0)
+    # Mass matrix inverse with robust epsilon
+    epsilon_area = 1e-6
+    safe_areas = np.maximum(2 * A, epsilon_area)
+    Minv = diags(1.0 / safe_areas, 0)
 
     # Mean curvature normal operator
     Delta_V = Minv @ (-L @ V)  # shape (N,3)
     HN = - Delta_V
     H_abs = np.linalg.norm(HN, axis=1) / 2.0
+    # Clamp extreme curvature values
+    H_abs = np.clip(H_abs, 0, 1e3)
     sign = np.sign(np.sum(normals * HN, axis=1))
     mean_curvature = sign * H_abs
 
     # For Gaussian curvature
     kg = np.zeros(N)
+    epsilon_area = 1e-6
     for i in range(N):
         sum_theta = 0.0
         for t in incident_tri[i]:
@@ -266,9 +324,15 @@ def compute_curvature(vertices, faces):
             else:
                 p0, p1, p2 = V[c], V[a], V[b]
             cot = cotangent_weight(p0, p1, p2)
-            theta = np.arctan(1 / cot) if cot != 0 else np.pi / 2
+            # Robust angle calculation
+            if abs(cot) < 1e-8:
+                theta = np.pi / 2
+            else:
+                theta = np.arctan(1 / cot)
             sum_theta += theta
-        kg[i] = (2 * np.pi - sum_theta) / (A[i] + 1e-10)
+        # Use robust epsilon and clamp result
+        safe_area = max(A[i], epsilon_area)
+        kg[i] = np.clip((2 * np.pi - sum_theta) / safe_area, -1e3, 1e3)
 
     # Principal curvatures
     disc = mean_curvature ** 2 - kg
@@ -277,20 +341,26 @@ def compute_curvature(vertices, faces):
     k1 = mean_curvature + sqrt_disc
     k2 = mean_curvature - sqrt_disc
 
-    # Shape index
+    # Shape index with robust computation
     k_max = np.maximum(k1, k2)
     k_min = np.minimum(k1, k2)
-    denom = k_max - k_min + 1e-10
+    epsilon_shape = 1e-6
+    denom = np.maximum(k_max - k_min, epsilon_shape)
     ratio = (k_max + k_min) / denom
+    # Clamp ratio to prevent extreme arctan values
+    ratio = np.clip(ratio, -1e3, 1e3)
     shape_index = (2 / np.pi) * np.arctan(ratio)
+    # Final safety: ensure shape_index is in valid range
+    shape_index = np.clip(shape_index, -1.0, 1.0)
 
     return mean_curvature, shape_index
 
 def compute_geodesic_distances(vertices, faces):
     """
-    Fast, correct, CPU-based Dijkstra using scipy.
-    Works for any F > V.
-    No GPU. No errors.
+    Compute geodesic distance matrix between all vertices on the mesh using Dijkstra's algorithm.
+    :param vertices: (N, 3) array of vertex positions
+    :param faces: (M, 3) array of triangle vertex indices
+    :return: (N, N) array of geodesic distances
     """
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
