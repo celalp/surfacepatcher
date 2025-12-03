@@ -1,43 +1,51 @@
 import pickle
-import torch
 import numpy as np
-from tqdm import tqdm
+from surfacepatcher.utils import presets
+from surfacepatcher.gpu_utils import GPUManager
 
 class PatchComparison:
-    def __init__(self, patches1, patches2, feature_weights=None, use_epitope_weights=True):
+    def __init__(self, patches1, patches2, feature_weights=None, use_gpu=True):
         """
         Perform pairwise comparisons on all patches and their rotations using GPU acceleration.
+        
         :param patches1: geodesic_patcher.geodesic_patcher.ProteinPatches for protein A
         :param patches2: geodesic_patcher.geodesic_patcher.ProteinPatches for protein B
         :param feature_weights: Optional custom weights for features (shape_index, mean_curvature, 
                                electrostatic, h_bond_donor, h_bond_acceptor, hydrophobicity)
-                               If None and use_epitope_weights=True, uses epitope-optimized weights
-        :param use_epitope_weights: If True, uses epitope-specific feature weights by default
+        :param use_gpu: Whether to use GPU acceleration (default: True)
         """
         self.patches1 = patches1
         self.patches2 = patches2
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_gpu = use_gpu
+        
+        # Initialize GPU manager and device
+        if use_gpu:
+            import torch
+            self.gpu_manager = GPUManager(use_gpu=True)
+            self.device = self.gpu_manager.device
+            self.torch_available = True
+        else:
+            self.gpu_manager = None
+            self.device = None
+            self.torch_available = False
 
         #TODO need to get the weights from the static method
         # Set feature weights
         if feature_weights is not None:
-            self.feature_weights = torch.tensor(feature_weights, dtype=torch.float32)
-        elif use_epitope_weights:
+            feature_weights_array = feature_weights
+        else:
             # Epitope-optimized weights based on antibody-antigen binding importance
             # Order: shape_index, mean_curvature, electrostatic, h_bond_donor, h_bond_acceptor, hydrophobicity
-            self.feature_weights = torch.tensor([
-                2.0,  # shape_index - convex/concave complementarity (critical)
-                1.5,  # mean_curvature - surface topology (important)
-                2.0,  # electrostatic - charged residues attract antibodies (critical)
-                1.8,  # h_bond_donor - binding specificity (very important)
-                1.8,  # h_bond_acceptor - binding specificity (very important)
-                1.2   # hydrophobicity - hydrophobic patches (moderately important)
-            ], dtype=torch.float32)
-        else:
-            # Uniform weights (all features equally important)
-            self.feature_weights = torch.ones(6, dtype=torch.float32)
+            feature_weights_array = presets["epitope"]
         
-        self.feature_weights = self.feature_weights.to(self.device)
+        # Store as numpy array first, convert to tensor if using GPU
+        self.feature_weights_np = np.array(feature_weights_array, dtype=np.float32)
+        
+        if use_gpu:
+            import torch
+            self.feature_weights = torch.tensor(self.feature_weights_np, dtype=torch.float32).to(self.device)
+        else:
+            self.feature_weights = None
 
     def compute(self, batch_size=100):
         """
@@ -52,6 +60,14 @@ class PatchComparison:
                  keys1: list of keys for patches1 corresponding to rows
                  keys2: list of keys for patches2 corresponding to columns
         """
+        if not self.torch_available:
+            raise RuntimeError(
+                "PyTorch is required for PatchComparison but is not available. "
+                "Please install PyTorch: pip install torch"
+            )
+        
+        import torch
+        
         # 1. Prepare Data for Protein 1 (Query)
         # We only need one reference rotation (e.g., index 0) for P1
         keys1 = sorted(list(self.patches1.descriptors.keys()))
@@ -65,12 +81,9 @@ class PatchComparison:
         tensor1 = torch.stack(list1).float().to(self.device)
         N1, M_ang, K, P = tensor1.shape
         
-        # Apply feature weights before flattening
-        # Broadcast weights to (1, 1, 1, P) and multiply
-        weighted_tensor1 = tensor1 * self.feature_weights.view(1, 1, 1, P)
-        
-        # Flatten: (N1, M_ang * K * P)
-        tensor1 = weighted_tensor1.view(N1, -1) 
+        # Flatten first: (N1, M_ang * K * P)
+        # Structure: each row is [all M_ang*K points for feature_0, all M_ang*K points for feature_1, ...]
+        tensor1_flat = tensor1.view(N1, -1)
         
         # 2. Prepare Data for Protein 2 (Target)
         # We keep all rotations to search against
@@ -83,36 +96,87 @@ class PatchComparison:
         tensor2 = torch.stack(list2).float().to(self.device)
         N2, M_rot, M_ang2, K2, P2 = tensor2.shape
         
-        # Apply feature weights before flattening
-        # Broadcast weights to (1, 1, 1, 1, P) and multiply
-        weighted_tensor2 = tensor2 * self.feature_weights.view(1, 1, 1, 1, P2)
-        
         # Flatten: (N2 * M_rot, M_ang * K * P)
-        F = tensor1.shape[1]
-        tensor2_flat = weighted_tensor2.view(-1, F)
+        F = tensor1_flat.shape[1]
+        tensor2_flat = tensor2.view(-1, F)
         
-        # 3. Compute Distances in Batches
-        # ||A - B||^2 = ||A||^2 + ||B||^2 - 2<A, B>
+        # --- Feature Standardization ---
+        # Reshape to (Total_Points, P) to compute stats per feature
+        # Combine samples from both proteins for robust statistics
+        # tensor1: (N1, M_ang, K, P)
+        # tensor2: (N2, M_rot, M_ang, K, P)
         
-        # Precompute norms
-        norm1_sq = (tensor1 ** 2).sum(dim=1, keepdim=True) # (N1, 1)
-        norm2_sq = (tensor2_flat ** 2).sum(dim=1) # (N2 * M_rot)
+        t1_for_stats = tensor1.view(-1, P)
+        t2_for_stats = tensor2.view(-1, P)
+        all_features = torch.cat([t1_for_stats, t2_for_stats], dim=0)
+        
+        # Compute mean and std per feature
+        feat_mean = all_features.mean(dim=0)
+        feat_std = all_features.std(dim=0)
+        
+        # Avoid division by zero
+        feat_std[feat_std < 1e-6] = 1.0
+        
+        # Normalize tensors
+        # tensor1_flat: (N1, M_ang*K*P) -> View as (N1, M_ang*K, P)
+        points_per_sample = M_ang * K
+        
+        t1_normalized = (tensor1.view(-1, P) - feat_mean) / feat_std
+        tensor1_flat = t1_normalized.view(N1, -1)
+        
+        t2_normalized = (tensor2.view(-1, P) - feat_mean) / feat_std
+        tensor2_flat = t2_normalized.view(-1, F)
+        
+        # -------------------------------
+        
+        # Apply feature weights to compute weighted norm per feature channel
+        # Reshape to separate features: (N, M_ang*K, P)
+        points_per_feature = M_ang * K
+        tensor1_by_feat = tensor1_flat.view(N1, points_per_feature, P)
+        tensor2_by_feat = tensor2_flat.view(-1, points_per_feature, P2)
+        
+        # Weight each feature channel and compute norms
+        # For each sample, compute ||feat_i * weight_i||^2 for each feature i
+        weighted_norm1_sq = torch.zeros(N1, device=self.device)
+        weighted_norm2_sq = torch.zeros(tensor2_flat.shape[0], device=self.device)
+        
+        for feat_idx in range(P):
+            feat1 = tensor1_by_feat[:, :, feat_idx]  # (N1, points_per_feature)
+            feat2 = tensor2_by_feat[:, :, feat_idx]  # (N2*M_rot, points_per_feature)
+            weight = self.feature_weights[feat_idx]
+            
+            weighted_norm1_sq += weight * weight * (feat1 ** 2).sum(dim=1)
+            weighted_norm2_sq += weight * weight * (feat2 ** 2).sum(dim=1)
+        
+        
+        # 3. Compute Distances in Batches with feature weighting
+        # ||A - B||^2 with weights = sum_i w_i^2 * ||A_i - B_i||^2
+        # = sum_i w_i^2 * (||A_i||^2 + ||B_i||^2 - 2<A_i, B_i>)
         
         all_min_dists = []
         all_min_idxs = []
         
         # Process P1 in batches
-        for i in tqdm(range(0, N1, batch_size), desc="Computing distances"):
+        for i in range(0, N1, batch_size):
             end = min(i + batch_size, N1)
-            batch1 = tensor1[i:end] # (B, F)
-            batch_norm1 = norm1_sq[i:end] # (B, 1)
+            batch1_by_feat = tensor1_by_feat[i:end]  # (B, points_per_feature, P)
+            batch_norm1 = weighted_norm1_sq[i:end].unsqueeze(1)  # (B, 1)
             
-            # Dot product: (B, F) @ (F, N2*M_rot) -> (B, N2*M_rot)
-            dot = torch.matmul(batch1, tensor2_flat.T)
+            # Compute weighted dot product across all features
+            # For each sample pair, compute sum_i w_i^2 * <A_i, B_i>
+            weighted_dot = torch.zeros(end - i, tensor2_flat.shape[0], device=self.device)
             
-            # Distance squared: (B, 1) + (N2*M_rot) - (B, N2*M_rot)
-            # Broadcasting works: (B, 1) + (1, N2*M_rot)
-            dist_sq = batch_norm1 + norm2_sq.unsqueeze(0) - 2 * dot
+            for feat_idx in range(P):
+                feat1_batch = batch1_by_feat[:, :, feat_idx]  # (B, points_per_feature)
+                feat2_all = tensor2_by_feat[:, :, feat_idx]    # (N2*M_rot, points_per_feature)
+                weight = self.feature_weights[feat_idx]
+                
+                # Dot product for this feature
+                dot_feat = torch.matmul(feat1_batch, feat2_all.T)  # (B, N2*M_rot)
+                weighted_dot += weight * weight * dot_feat
+            
+            # Distance squared: ||A||^2 + ||B||^2 - 2<A, B>
+            dist_sq = batch_norm1 + weighted_norm2_sq.unsqueeze(0) - 2 * weighted_dot
             
             # Clamp to 0 to avoid negative due to precision
             dist_sq = torch.clamp(dist_sq, min=0.0)
@@ -147,78 +211,13 @@ class PatchComparison:
             "indices": idxs,
             "keys1": k1,
             "keys2": k2,
-            "feature_weights": self.feature_weights.cpu().numpy()
+            "feature_weights": self.feature_weights.cpu().numpy() if self.torch_available else self.feature_weights_np
         }
         with open(path, 'wb') as f:
             pickle.dump(data, f)
-    
-    def get_feature_weights(self):
-        """
-        Get the current feature weights.
-        :return: Dictionary mapping feature names to weights
-        """
-        feature_names = [
-            'shape_index',
-            'mean_curvature', 
-            'electrostatic',
-            'h_bond_donor',
-            'h_bond_acceptor',
-            'hydrophobicity'
-        ]
-        weights = self.feature_weights.cpu().numpy()
-        return {name: float(weight) for name, weight in zip(feature_names, weights)}
-    
-    def print_weights(self):
-        """Print the current feature weights in a readable format."""
-        weights_dict = self.get_feature_weights()
-        print("Current Feature Weights:")
-        print("-" * 50)
-        for feature, weight in weights_dict.items():
-            bar = "█" * int(weight * 10)
-            print(f"{feature:20s}: {weight:.1f} {bar}")
-        print("-" * 50)
-    
-    @staticmethod
-    def get_preset_weights(preset='epitope'):
-        """
-        Get preset feature weights for different use cases.
-        
-        :param preset: One of 'epitope', 'general', 'enzyme', 'interface'
-        :return: List of 6 weights for features
-        """
-        presets = {
-            'epitope': [
-                2.0,  # shape_index - critical for antibody binding
-                1.5,  # mean_curvature
-                2.0,  # electrostatic - critical for antibody binding
-                1.8,  # h_bond_donor
-                1.8,  # h_bond_acceptor
-                1.2   # hydrophobicity
-            ],
-            'general': [
-                1.0, 1.0, 1.0, 1.0, 1.0, 1.0  # All equal
-            ],
-            'enzyme': [
-                1.5,  # shape_index - pocket shape important
-                1.3,  # mean_curvature
-                1.8,  # electrostatic - catalytic residues often charged
-                2.0,  # h_bond_donor - critical for catalysis
-                2.0,  # h_bond_acceptor - critical for catalysis
-                1.4   # hydrophobicity - substrate binding
-            ],
-            'interface': [
-                2.0,  # shape_index - complementarity critical
-                1.8,  # mean_curvature
-                1.5,  # electrostatic - important but variable
-                1.6,  # h_bond_donor
-                1.6,  # h_bond_acceptor
-                1.7   # hydrophobicity - important for interfaces
-            ]
-        }
-        
-        if preset not in presets:
-            raise ValueError(f"Unknown preset '{preset}'. Choose from: {list(presets.keys())}")
-        
-        return presets[preset]
+
+        return None
+
+
 
 

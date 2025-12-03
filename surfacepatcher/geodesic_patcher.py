@@ -1,6 +1,5 @@
 import os
 import pickle
-import tempfile
 from dataclasses import dataclass
 
 import torch
@@ -26,8 +25,8 @@ class GeodesicPatcher:
         """
         # 1. Load protein and select chain
         traj = md.load(pdb_file)
-        if chain_id:
-            traj = traj.atom_slice(traj.topology.select(f"chainid == {self.chain_id}")) #TODO Change to expression
+        if chain_id is not None:
+            traj = traj.atom_slice(traj.topology.select(f"chainid == {chain_id}"))
 
         vertices, faces, normals, atom_ids = compute_msms_surface(traj.xyz[0], traj)
         return traj, vertices, faces, normals, atom_ids
@@ -92,7 +91,6 @@ class GeodesicPatcher:
 
         return patches, dist_matrix
 
-
     def compute_detailed_patch_descriptors(self, patches, vertices, dist_matrix, normals, radius, M=36, K=5) -> torch.Tensor:
         """
         compute radial descriptors, starting form the center of the patch move to the diameter with M interval so 36 means
@@ -114,7 +112,13 @@ class GeodesicPatcher:
             center_normal = normals[center_idx]
 
             patch_indices = patch['indices']
-            if len(patch_indices) < 360/M:  # Skip small patches
+            
+            # Initialize zero descriptor for degenerate cases
+            # Shape: (M, M, K, P) - M rotations of (M, K, P) descriptor
+            zero_descriptor = torch.zeros((M, M, K, P)).float()
+            
+            if len(patch_indices) < 360/M:  # Too small patches
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
 
             local_indices = np.arange(len(patch_indices))  # 0 to len-1 for local
@@ -131,6 +135,7 @@ class GeodesicPatcher:
             
             # Check if we have enough valid projected vectors
             if np.sum(mask) < 2:
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue  # Skip patches with insufficient tangent plane data
             
             unit_proj = np.zeros_like(proj_vecs)
@@ -139,19 +144,23 @@ class GeodesicPatcher:
             # Choose reference direction u0: closest neighbor
             nonzero_local = local_indices[mask & (patch_dists > epsilon_norm)]
             if len(nonzero_local) == 0:
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
+
             closest_local = nonzero_local[np.argmin(patch_dists[nonzero_local])]
             u0 = unit_proj[closest_local]
             
             # Ensure u0 is normalized
             u0_norm = np.linalg.norm(u0)
             if u0_norm < epsilon_norm:
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
             u0 = u0 / u0_norm
             
             v0 = np.cross(center_normal, u0)
             v0_norm = np.linalg.norm(v0)
             if v0_norm < epsilon_norm:
+                detailed_descriptors[center_idx] = zero_descriptor
                 continue
             v0 = v0 / v0_norm
 

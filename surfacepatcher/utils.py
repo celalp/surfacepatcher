@@ -16,6 +16,36 @@ hydro_scale = {
     'THR': -0.7, 'TRP': -0.9, 'TYR': -1.3, 'VAL': 4.2
 }
 
+presets = {
+            'epitope': [
+                2.0,  # shape_index - critical for antibody binding
+                1.5,  # mean_curvature
+                2.0,  # electrostatic - critical for antibody binding
+                1.8,  # h_bond_donor
+                1.8,  # h_bond_acceptor
+                1.2   # hydrophobicity
+            ],
+            'general': [
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0  # All equal
+            ],
+            'enzyme': [
+                1.5,  # shape_index - pocket shape important
+                1.3,  # mean_curvature
+                1.8,  # electrostatic - catalytic residues often charged
+                2.0,  # h_bond_donor - critical for catalysis
+                2.0,  # h_bond_acceptor - critical for catalysis
+                1.4   # hydrophobicity - substrate binding
+            ],
+            'interface': [
+                2.0,  # shape_index - complementarity critical
+                1.8,  # mean_curvature
+                1.5,  # electrostatic - important but variable
+                1.6,  # h_bond_donor
+                1.6,  # h_bond_acceptor
+                1.7   # hydrophobicity - important for interfaces
+            ]
+}
+
 def compute_msms_surface(coords, traj):
     """
     Compute molecular surface using MSMS and return vertices, faces, normals, and atom IDs.
@@ -93,7 +123,7 @@ def project_electrostatics(traj, vertices):
                 if atom.name in sidechain_atoms:
                     charged_atoms.append(atom.index)
                     charges.append(total_charge / len(sidechain_atoms))
-        # Note: Ignoring HIS, other titratable groups for simplicity
+        # Ignoring HIS, other titratable groups for simplicity
 
     if not charged_atoms:
         return np.zeros(len(vertices))  # No charges, zero potential
@@ -107,12 +137,13 @@ def project_electrostatics(traj, vertices):
     # Coulomb potential: sum (q / r), with epsilon to avoid division by zero
     epsilon = 1e-3  # Increased epsilon for more stability
     potentials = np.sum(charges / (dists + epsilon), axis=1)
-    # Clamp extreme electrostatic values
-    potentials = np.clip(potentials, -1e3, 1e3)
+    # Clamp extreme electrostatic values, it is unlikely to have very high potentials we are
+    # selecting relatively small patches here
+    potentials = np.clip(potentials, -10, 10)
 
     return potentials
 
-def project_hbond_propensity(traj, vertices, mode):
+def project_hbond_propensity(traj, vertices, mode, sigma=2.0):
     """Project H-bond donor or acceptor propensity as density to surface vertices using Gaussian kernel.
     :param traj: mdtraj.Trajectory object
     :param vertices: (M, 3) array of surface vertex coordinates
@@ -140,11 +171,8 @@ def project_hbond_propensity(traj, vertices, mode):
 
     hb_pos = atom_pos[hb_atoms]
 
-    # Compute distances
+    # Compute distances, this is euclidian but that's fine because we are dealing with close vertices in the mesh/graph
     dists = cdist(vertices, hb_pos)
-
-    # Gaussian kernel for density (sigma=2.0 Å, adjustable)
-    sigma = 2.0
     weights = np.exp(-dists ** 2 / (2 * sigma ** 2))
 
     # Propensity as summed density

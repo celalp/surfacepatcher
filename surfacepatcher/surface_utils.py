@@ -3,7 +3,6 @@ Helper utilities for point cloud and topological comparison methods.
 Provides functions to reconstruct surface information from patches.
 """
 
-import numpy as np
 import mdtraj as md
 from surfacepatcher.utils import compute_msms_surface
 

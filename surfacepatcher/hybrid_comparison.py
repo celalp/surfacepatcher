@@ -1,11 +1,12 @@
+import pickle
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from scipy.stats import rankdata
-
+from surfacepatcher.gpu_utils import GPUManager
 
 class HybridComparison:
     def __init__(self, geodesic_results=None, pointcloud_results=None, topological_results=None,
-                 weights=None, fusion_method='weighted_sum'):
+                 weights=None, fusion_method='weighted_sum', use_gpu=True):
         """
         Combine multiple surface comparison methods into a unified similarity metric.
         
@@ -14,11 +15,17 @@ class HybridComparison:
         :param topological_results: Tuple (distances, keys1, keys2) from TopologicalComparison
         :param weights: Dict with keys 'geodesic', 'pointcloud', 'topological' (default: equal weights)
         :param fusion_method: 'weighted_sum', 'rank_fusion', or 'product'
+        :param use_gpu: Whether to use GPU acceleration for fusion operations (default: True)
         """
         self.geodesic_results = geodesic_results
         self.pointcloud_results = pointcloud_results
         self.topological_results = topological_results
         self.fusion_method = fusion_method
+        self.use_gpu = use_gpu
+        
+        # Initialize GPU manager
+
+        self.gpu_manager = GPUManager(use_gpu=use_gpu) if use_gpu else None
         
         # Set default weights
         if weights is None:
@@ -38,7 +45,9 @@ class HybridComparison:
         """
         Get preset weight configurations for different use cases.
         
-        :param preset: One of 'balanced', 'epitope', 'shape_focused', 'topology_focused'
+        :param preset: One of 'balanced', 'epitope', 'shape_focused', 'topology_focused' I completely made up these
+        numbers in the sense that I am not sure what epiptote centric would look like. I figured it has more to do with shape and 
+        electrostatics/hydrophobicity than anything else. 
         :return: Dict of weights
         """
         presets = {
@@ -72,10 +81,16 @@ class HybridComparison:
     def _normalize_distances(self, distances):
         """
         Normalize distance matrix to [0, 1] range using min-max scaling.
+        Uses GPU acceleration when enabled.
         
         :param distances: (N1, N2) distance matrix
         :return: Normalized distances
         """
+        if self.use_gpu and self.gpu_manager is not None:
+            from surfacepatcher.gpu_utils import normalize_matrix_gpu
+            return normalize_matrix_gpu(distances, device=self.gpu_manager.device)
+        
+        # CPU path
         min_val = np.min(distances)
         max_val = np.max(distances)
         
@@ -87,10 +102,16 @@ class HybridComparison:
     def _rank_distances(self, distances):
         """
         Convert distances to ranks (lower rank = more similar).
+        Uses GPU acceleration when enabled.
         
         :param distances: (N1, N2) distance matrix
         :return: Rank matrix
         """
+        if self.use_gpu and self.gpu_manager is not None:
+            from surfacepatcher.gpu_utils import rank_matrix_gpu
+            return rank_matrix_gpu(distances, device=self.gpu_manager.device)
+        
+        # CPU path
         # Flatten, rank, reshape
         flat_dists = distances.flatten()
         ranks = rankdata(flat_dists, method='average')
@@ -104,6 +125,9 @@ class HybridComparison:
         Compute hybrid distance matrix combining all available methods.
         
         :return: (combined_distances, keys1, keys2)
+                 combined_distances: np.ndarray of shape (N1, N2) with fused distances
+                 keys1: list of keys for patches1 corresponding to rows
+                 keys2: list of keys for patches2 corresponding to columns
         """
         available_methods = []
         distance_matrices = []
@@ -150,6 +174,23 @@ class HybridComparison:
             rank_matrices = [self._rank_distances(d) for d in distance_matrices]
             combined = sum(w * r for w, r in zip(method_weights, rank_matrices))
             
+        elif self.fusion_method == 'reciprocal_rank_fusion':
+            # Reciprocal rank fusion - better for preserving magnitude information
+            # Convert distances to reciprocal ranks and weight by magnitude
+            combined = np.zeros_like(distance_matrices[0])
+            for d, w in zip(distance_matrices, method_weights):
+                # Rank distances (lower rank = smaller distance = more similar)
+                flat_dists = d.flatten()
+                ranks = np.argsort(np.argsort(flat_dists)) + 1  # Ranks start from 1
+                rank_matrix = ranks.reshape(d.shape).astype(np.float32)
+                
+                # Reciprocal rank with weight
+                reciprocal_scores = w / (rank_matrix + 60)  # k=60 is common for RRF
+                combined += reciprocal_scores
+            
+            # Normalize to distance (invert scores)
+            combined = 1.0 / (combined + 1e-10)
+            
         elif self.fusion_method == 'product':
             # Multiplicative fusion (geometric mean)
             normalized_matrices = [self._normalize_distances(d) + 1e-10 for d in distance_matrices]
@@ -190,37 +231,31 @@ class HybridComparison:
         
         return correlations
     
-    def get_top_matches(self, n=10, method='hybrid'):
+    def save_distances(self, path, results):
         """
-        Get top N matches across all patch pairs.
+        Save the hybrid comparison results.
         
-        :param n: Number of top matches to return
-        :param method: 'hybrid', 'geodesic', 'pointcloud', or 'topological'
-        :return: List of (patch1_idx, patch2_idx, distance) tuples
+        :param path: Output file path
+        :param results: Tuple (distances, keys1, keys2) from compare()
         """
-        if method == 'hybrid':
-            distances, keys1, keys2 = self.compute()
-        elif method == 'geodesic' and self.geodesic_results is not None:
-            distances = self.geodesic_results[0]
-            keys1, keys2 = self.geodesic_results[2], self.geodesic_results[3]
-        elif method == 'pointcloud' and self.pointcloud_results is not None:
-            distances, keys1, keys2 = self.pointcloud_results
-        elif method == 'topological' and self.topological_results is not None:
-            distances, keys1, keys2 = self.topological_results
-        else:
-            raise ValueError(f"Method '{method}' not available")
+        dists, k1, k2 = results
+        data = {
+            "distances": dists,
+            "keys1": k1,
+            "keys2": k2,
+            "weights": self.weights,
+            "fusion_method": self.fusion_method,
+            "available_methods": []
+        }
         
-        # Find top N matches
-        flat_dists = distances.flatten()
-        flat_indices = np.argsort(flat_dists)[:n]
+        # Record which methods were used
+        if self.geodesic_results is not None:
+            data["available_methods"].append("geodesic")
+        if self.pointcloud_results is not None:
+            data["available_methods"].append("pointcloud")
+        if self.topological_results is not None:
+            data["available_methods"].append("topological")
         
-        matches = []
-        for idx in flat_indices:
-            i = idx // len(keys2)
-            j = idx % len(keys2)
-            matches.append((keys1[i], keys2[j], distances[i, j]))
-        
-        return matches
-
-    #TODO add pickling
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
     

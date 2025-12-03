@@ -6,12 +6,14 @@ from surfacepatcher.surface_utils import SurfaceCache
 
 from gtda.homology import VietorisRipsPersistence
 from gtda.diagrams import PersistenceEntropy, Amplitude, NumberOfPoints, PairwiseDistance
+from surfacepatcher.gpu_utils import GPUManager, compute_pairwise_distances_gpu, compute_feature_distances_gpu
 
 
 class TopologicalComparison:
     def __init__(self, patches1, patches2, homology_dimensions=(0, 1, 2),
                  max_edge_length=15.0, use_feature_filtration=True,
-                 surface_cache=None):
+                 surface_cache=None, use_gpu=True, feature_distance_weight=2.0,
+                 normalization_mode='global'):
         """
         Compare protein surface patches using persistent homology and topological descriptors.
         
@@ -21,6 +23,9 @@ class TopologicalComparison:
         :param max_edge_length: Maximum edge length for Vietoris-Rips filtration
         :param use_feature_filtration: If True, also compute feature-weighted filtrations
         :param surface_cache: Optional SurfaceCache instance (will create if None)
+        :param use_gpu: Whether to use GPU acceleration (default: True)
+        :param feature_distance_weight: Weight for combining feature distances with geometric distances (default: 2.0)
+        :param normalization_mode: 'global' (fixed ranges) or 'per_patch' (min-max per patch)
         """
         
         self.patches1 = patches1
@@ -28,6 +33,12 @@ class TopologicalComparison:
         self.homology_dimensions = homology_dimensions
         self.max_edge_length = max_edge_length
         self.use_feature_filtration = use_feature_filtration
+        self.use_gpu = use_gpu
+        self.feature_distance_weight = feature_distance_weight
+        self.normalization_mode = normalization_mode
+        
+        # GPU manager
+        self.gpu_manager = GPUManager(use_gpu=use_gpu) if use_gpu else None
         
         # Surface cache for accessing vertices
         self.surface_cache = surface_cache if surface_cache is not None else SurfaceCache()
@@ -80,7 +91,7 @@ class TopologicalComparison:
         
         return diagrams[0]  # Return single diagram
 
-    #TODO this is not done, need to implement proper feature-based filtration
+
     def _compute_feature_weighted_persistence(self, points, feature_values, feature_name):
         """
         Compute persistence using a feature as the filtration function.
@@ -91,18 +102,50 @@ class TopologicalComparison:
         :param feature_name: Name of the feature (for debugging)
         :return: Modified persistence diagram
         """
-        # Create distance matrix weighted by feature similarity
-        geom_dists = cdist(points, points, metric='euclidean')
-        
-        # Normalize feature values
-        feat_norm = (feature_values - feature_values.min()) / (feature_values.max() - feature_values.min() + 1e-10)
-        
-        # Feature distance matrix
-        feat_dists = np.abs(feat_norm[:, None] - feat_norm[None, :])
 
-        # Combined distance: geometric + feature
-        # Weight feature contribution
-        combined_dists = geom_dists + 2.0 * feat_dists
+        # Normalize feature values based on mode
+        if self.normalization_mode == 'global':
+            # Use fixed ranges based on feature type to preserve absolute magnitude info
+            if feature_name == 'electrostatic':
+                # Typical range approx -10 to 10 (or larger depending on units, here assuming simple Coulomb)
+                # Clamp and normalize to [0, 1]
+                min_val, max_val = -10.0, 10.0
+                feat_norm = np.clip(feature_values, min_val, max_val)
+                feat_norm = (feat_norm - min_val) / (max_val - min_val)
+            elif feature_name == 'hydrophobicity':
+                # Doolittle scale: -4.5 to 4.5
+                min_val, max_val = -4.5, 4.5
+                feat_norm = np.clip(feature_values, min_val, max_val)
+                feat_norm = (feat_norm - min_val) / (max_val - min_val)
+            elif feature_name in ['hbond_donor', 'hbond_acceptor']:
+                # Propensity 0 to 1
+                feat_norm = np.clip(feature_values, 0.0, 1.0)
+            else:
+                # Fallback to per-patch if unknown
+                feat_norm = (feature_values - feature_values.min()) / (feature_values.max() - feature_values.min() + 1e-10)
+        else:
+            # Per-patch min-max normalization
+            feat_norm = (feature_values - feature_values.min()) / (feature_values.max() - feature_values.min() + 1e-10)
+
+
+        # Create distance matrix weighted by feature similarity
+        if self.use_gpu and self.gpu_manager is not None:
+            # Use GPU-accelerated computation with pre-normalized features
+            combined_dists = compute_feature_distances_gpu(
+                points, feat_norm, 
+                device=self.gpu_manager.device,
+                feature_weight=self.feature_distance_weight,
+                skip_normalization=True
+            )
+        else:
+            # CPU Fallback
+            geom_dists = cdist(points, points, metric='euclidean')
+            
+            # Feature distance matrix using our pre-normalized values
+            feat_dists = np.abs(feat_norm[:, None] - feat_norm[None, :])
+    
+            # Combined distance: geometric + feature
+            combined_dists = geom_dists + self.feature_distance_weight * feat_dists
         
         # Use precomputed distance matrix for filtration
         # We need a new instance because the main one is configured for point clouds (metric='euclidean')
@@ -191,8 +234,13 @@ class TopologicalComparison:
         
         if len(points) < 4:
             # Too few points for meaningful topology
-            # Return zero vector
-            return np.zeros(100)  # Placeholder size
+            # Calculate expected descriptor size based on configuration
+            # Each diagram contributes: 1 (entropy) + 3 (amplitude metrics) + len(homology_dims) (n_points) + 11*len(homology_dims) (stats)
+            n_diagrams = 5 if self.use_feature_filtration else 1
+            dim_count = len(self.homology_dimensions)
+            per_diagram_size = 1 + 3 + dim_count + 11 * dim_count  # entropy + 3 amplitudes + n_points + 11 stats per dim
+            expected_size = n_diagrams * per_diagram_size
+            return np.zeros(expected_size)
         
         # 1. Standard geometric persistence
         diagram_geom = self._compute_persistence_diagram(points)
@@ -285,7 +333,7 @@ class TopologicalComparison:
         
         return [diagram_geom, diagram_elec, diagram_hydro, diagram_hbond_donor, diagram_hbond_acceptor]
 
-    #TODO no wasserstein distance implemented yet
+
     def compute(self, distance_metric='euclidean'):
         """
         Compute pairwise distances between patches using topological descriptors.
@@ -296,14 +344,12 @@ class TopologicalComparison:
         keys1 = sorted(list(self.patches1.patches.keys()))
         keys2 = sorted(list(self.patches2.patches.keys()))
         
-        print("Computing topological descriptors for protein 1...")
         descriptors1 = []
         for key in tqdm(keys1):
             patch = self.patches1.patches[key]
             desc = self._compute_patch_descriptor(patch, self.vertices1)
             descriptors1.append(desc)
         
-        print("Computing topological descriptors for protein 2...")
         descriptors2 = []
         for key in tqdm(keys2):
             patch = self.patches2.patches[key]
@@ -316,17 +362,20 @@ class TopologicalComparison:
         descriptors2 = np.array([np.pad(d, (0, max_len - len(d))) for d in descriptors2])
         
         # Compute pairwise distances
-        print("Computing pairwise distances...")
-        if distance_metric == 'euclidean':
-            distances = cdist(descriptors1, descriptors2, metric='euclidean')
-        elif distance_metric == 'cosine':
-            distances = cdist(descriptors1, descriptors2, metric='cosine')
+        if distance_metric in ['euclidean', 'cosine']:
+            if self.use_gpu and self.gpu_manager is not None:
+                distances = compute_pairwise_distances_gpu(
+                    descriptors1, descriptors2,
+                    metric=distance_metric,
+                    device=self.gpu_manager.device
+                )
+            else:
+                distances = cdist(descriptors1, descriptors2, metric=distance_metric)
+                
         elif distance_metric == 'wasserstein':
             # For Wasserstein, we need to re-compute or store diagrams instead of vectors
             # Since the current flow computes vectors, we'll need to fetch diagrams here
             # This is a bit inefficient if we already computed vectors, but cleaner for separation
-            print("Re-computing diagrams for Wasserstein distance...")
-            
             # Helper to get all diagrams for a set of patches
             def get_all_diagrams(patches_obj, vertices):
                 all_diagrams = [] # List of lists of diagrams

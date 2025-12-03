@@ -5,7 +5,6 @@ Based on 3D Zernike moments computed on a voxelized representation of the patch.
 
 import numpy as np
 from scipy.special import sph_harm, factorial
-from scipy.spatial.distance import cdist
 
 
 class Zernike3D:
@@ -151,16 +150,12 @@ class Zernike3D:
         # Spherical harmonic (using scipy)
         # Note: scipy uses physics convention (theta=polar, phi=azimuthal)
         # Check if sph_harm_y is available (SciPy >= 1.15)
-        try:
-            from scipy.special import sph_harm_y
-            angular = sph_harm_y(n, l, m, Theta, Phi) # Wait, sph_harm_y signature might be different
-            # sph_harm(m, n, theta, phi). sph_harm_y(n, m, theta, phi)?
-            # Let's stick to sph_harm for now to avoid signature mismatch issues without checking docs.
-            # The warning says: sph_harm(m, l, Phi, Theta).
-            # I will just keep sph_harm but fix the logic.
-            angular = sph_harm(m, l, Phi, Theta)
-        except ImportError:
-             angular = sph_harm(m, l, Phi, Theta)
+        # Spherical harmonic (using scipy)
+        # Note: scipy uses physics convention (theta=polar, phi=azimuthal)
+        # sph_harm(m, n, theta, phi) where theta is azimuthal, phi is polar.
+        # We mapped: Theta=polar, Phi=azimuthal.
+        # So we pass Phi (azimuthal) as 3rd arg, Theta (polar) as 4th arg.
+        angular = sph_harm(m, l, Phi, Theta)
         
         basis = radial * angular
         
