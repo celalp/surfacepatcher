@@ -1,18 +1,192 @@
-import pickle
+import shelve
 from dataclasses import dataclass
+from functools import cached_property
 
+import numpy
 import open3d as o3d
 
 from surfacepatcher.utils import *
 from surfacepatcher.process_pdb import PDBProcessor
 
+# keeping these bare bones for now no methods
+
+@dataclass(frozen=True)
+class ProteinPatch:
+    center: int
+    indices: numpy.ndarray
+    biochem_features: dict
+    fpfh_features: numpy.ndarray
+    vertices: numpy.ndarray
+    normals: numpy.ndarray
+    atom_ids: numpy.ndarray
+    residues: list
+
+    @cached_property
+    def pcd(self):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(self.vertices)
+        pcd.normals = o3d.utility.Vector3dVector(self.normals)
+        return pcd
+
+    @cached_property
+    def fpfh(self):
+        fpfh=o3d.pipelines.registration.Feature()
+        fpfh.data=self.fpfh_features
+        return fpfh
+
+
 @dataclass(frozen=True)
 class ProteinPatches:
     pdb_file: str
-    patches: dict
+    patches: dict  # dict[int, ProteinPatch]
     fpfh_radius: int
     max_nn: int
     patch_radius: int
+    shelve_path: str = None  # If loaded from shelve, store the path
+
+    @classmethod
+    def from_shelve(cls, shelve_path, load_patches=True):
+        """
+        Create a ProteinPatches object from a shelve database.
+
+        Args:
+            shelve_path: Path to shelve database (without extension)
+            load_patches: If True, loads all patches into memory.
+                         If False, creates empty patches dict (load on-demand later).
+
+        Returns:
+            ProteinPatches object
+        """
+        with shelve.open(shelve_path, 'r') as db:
+            metadata = db['metadata']
+
+            if load_patches:
+                # Load all patches into memory
+                patches = {}
+                for key in db.keys():
+                    if key != 'metadata':
+                        patches[int(key)] = db[key]
+            else:
+                # Just metadata, no patches loaded
+                patches = {}
+
+            return cls(
+                pdb_file=metadata['pdb_file'],
+                patches=patches,
+                fpfh_radius=metadata['fpfh_radius'],
+                max_nn=metadata['max_nn'],
+                patch_radius=metadata['patch_radius'],
+                shelve_path=shelve_path
+            )
+
+    def get_patch(self, patch_id):
+        """
+        Get a patch by ID. If patches dict is empty, loads from shelve.
+        If already in memory, returns from memory.
+
+        Args:
+            patch_id: ID of patch to retrieve
+
+        Returns:
+            ProteinPatch object
+        """
+        # If already in memory, return it
+        if patch_id in self.patches:
+            return self.patches[patch_id]
+
+        # Otherwise load from shelve
+        if self.shelve_path is None:
+            raise ValueError(f"Patch {patch_id} not found and no shelve_path available")
+
+        return self.load_patch(self.shelve_path, patch_id)
+
+
+    def save_patches(self, shelve_path):
+        """Save patches to a shelve database for random access by key."""
+        with shelve.open(shelve_path, 'n') as db:
+            db['metadata'] = {
+                'pdb_file': self.pdb_file,
+                'fpfh_radius': self.fpfh_radius,
+                'max_nn': self.max_nn,
+                'patch_radius': self.patch_radius,
+                'num_patches': len(self.patches)
+            }
+
+            for patch_id, patch in self.patches.items():
+                db[str(patch_id)] = patch
+
+    @staticmethod
+    def load_patch(shelve_path, patch_id):
+        """Load a single patch by ID from shelve database."""
+        with shelve.open(shelve_path, 'r') as db:
+            return db[str(patch_id)]
+
+    @staticmethod
+    def load_patches(shelve_path, patch_ids):
+        """Load multiple patches by IDs from shelve database."""
+        patches = {}
+        with shelve.open(shelve_path, 'r') as db:
+            for patch_id in patch_ids:
+                key = str(patch_id)
+                if key in db:
+                    patches[patch_id] = db[key]
+        return patches
+
+    @staticmethod
+    def get_all_patch_ids(shelve_path):
+        """Get all available patch IDs from shelve database."""
+        with shelve.open(shelve_path, 'r') as db:
+            return [int(key) for key in db.keys() if key != 'metadata']
+
+    def __getitem__(self, patch_id):
+        """Get a patch by ID (loads from shelve if needed)."""
+        return self.get_patch(patch_id)
+
+    def __len__(self):
+        """Number of patches (loaded or available in shelve)."""
+        if self.patches:
+            return len(self.patches)
+        elif self.shelve_path:
+            return len(self.get_all_patch_ids(self.shelve_path))
+        return 0
+
+    def __iter__(self):
+        """Iterate over patches (from memory or shelve)."""
+        if self.patches:
+            return iter(self.patches.items())
+        else:
+            return self.iter_patches_lazy()
+
+    def iter_patches_lazy(self, patch_ids=None):
+        """
+        Iterate over patches, loading from shelve on-demand.
+
+        Args:
+            patch_ids: Optional list of specific patch IDs to iterate.
+                      If None, iterates over all patches in shelve.
+
+        Yields:
+            Tuple of (patch_id: int, patch: ProteinPatch)
+        """
+        if self.shelve_path is None:
+            # If no shelve path, just iterate over loaded patches
+            if patch_ids:
+                for pid in patch_ids:
+                    if pid in self.patches:
+                        yield pid, self.patches[pid]
+            else:
+                yield from self.patches.items()
+        else:
+            # Load from shelve on-demand
+            if patch_ids is None:
+                patch_ids = self.get_all_patch_ids(self.shelve_path)
+
+            with shelve.open(self.shelve_path, 'r') as db:
+                for patch_id in patch_ids:
+                    key = str(patch_id)
+                    if key in db:
+                        yield patch_id, db[key]
+
 
 
 class GeodesicPatcher:
@@ -56,21 +230,16 @@ class GeodesicPatcher:
             for prop_name, prop_values in properties.items():
                 patch_features[prop_name] = prop_values[patch_indices]
 
-            patches[center_idx] = {
-                'center': self.vertices[center_idx],
-                'indices': patch_indices,
-                'biochem_features': patch_features,
-                'fpfh_features':fpfh_features,
-                'pcd':pcd,
-                'vertices':vertices,
-                'normals':normals,
-                'area': np.sum(patch_mask),  # Normalize by patch area later, maybe
-                'atom_ids': self.atom_ids[patch_indices],  # Add this
-                'residues': get_patch_residues(self.traj, self.atom_ids[patch_indices]),
-            }
+            patches[center_idx] = \
+                ProteinPatch(center_idx,
+                             patch_indices,
+                             patch_features,
+                             fpfh_features.data,
+                             vertices,
+                             normals,
+                             self.atom_ids[patch_indices],
+                             get_patch_residues(self.traj, self.atom_ids[patch_indices]))
 
+        patches = ProteinPatches(self.pdb, patches, fpfh_radius, max_nn, radius)
         return patches
 
-    def save_patches(self, patches, path):
-        with open(path, 'wb') as f:
-            pickle.dump(patches, f)

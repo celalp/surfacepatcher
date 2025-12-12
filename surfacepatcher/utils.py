@@ -170,3 +170,7 @@ def get_patch_residues(traj, atoms):
                  "residue": r.resSeq} for r in res_list]
 
     return residues
+
+#TODO need to reconstruct patches pcd and fpfh from data
+def load_patches(file):
+    pass

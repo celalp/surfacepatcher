@@ -8,6 +8,8 @@ dependencies:
   - python=3.11
   - msms
   - pdb2pqr
+  - apbs
+  - reduce
   - pip
   - pip:
       - torch
