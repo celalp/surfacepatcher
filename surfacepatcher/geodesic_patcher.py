@@ -16,8 +16,6 @@ class ProteinPatch:
     indices: numpy.ndarray
     biochem_features: dict
     fpfh_features: numpy.ndarray
-    vertices: numpy.ndarray
-    normals: numpy.ndarray
     atom_ids: numpy.ndarray
     residues: list
     skip:bool=False
