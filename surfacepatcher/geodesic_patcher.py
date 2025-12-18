@@ -20,6 +20,7 @@ class ProteinPatch:
     normals: numpy.ndarray
     atom_ids: numpy.ndarray
     residues: list
+    skip:bool=False
 
     @cached_property
     def pcd(self):
@@ -42,6 +43,9 @@ class ProteinPatches:
     fpfh_radius: int
     max_nn: int
     patch_radius: int
+    filter_radius: int
+    vertices: numpy.ndarray
+    normals: numpy.ndarray
     shelve_path: str = None  # If loaded from shelve, store the path
 
     @classmethod
@@ -76,6 +80,7 @@ class ProteinPatches:
                 fpfh_radius=metadata['fpfh_radius'],
                 max_nn=metadata['max_nn'],
                 patch_radius=metadata['patch_radius'],
+                filter_radius=metadata['filter_radius'],
                 shelve_path=shelve_path
             )
 
@@ -100,6 +105,20 @@ class ProteinPatches:
 
         return self.load_patch(self.shelve_path, patch_id)
 
+    @cached_property
+    def dist_matrix(self):
+        dist_matrix = compute_geodesic_distances(self.vertices, self.faces)
+        return dist_matrix
+
+    def get_neighbors(self, patch_id, radius=None, return_patches=False):
+        mask=self.dist_matrix[patch_id]<=radius
+        patch_indices = np.where(mask)[0]
+        if return_patches:
+            patches=self.load_patches(self.shelve_path, patch_indices)
+            return patches
+        else:
+            return patch_indices
+
 
     def save_patches(self, shelve_path):
         """Save patches to a shelve database for random access by key."""
@@ -109,6 +128,9 @@ class ProteinPatches:
                 'fpfh_radius': self.fpfh_radius,
                 'max_nn': self.max_nn,
                 'patch_radius': self.patch_radius,
+                'vertices': self.vertices,
+                'normals': self.normals,
+                'filter_radius': self.filter_radius,
                 'num_patches': len(self.patches)
             }
 
@@ -119,7 +141,7 @@ class ProteinPatches:
     def load_patch(shelve_path, patch_id):
         """Load a single patch by ID from shelve database."""
         with shelve.open(shelve_path, 'r') as db:
-            return db[str(patch_id)]
+            return patch_id, db[str(patch_id)]
 
     @staticmethod
     def load_patches(shelve_path, patch_ids):
@@ -207,15 +229,21 @@ class GeodesicPatcher:
 
         return properties
 
-    def get_patches(self, radius, properties, fpfh_radius=5, max_nn=30):
+    def get_patches(self, radius, properties, filter_radius=10, fpfh_radius=5, max_nn=30):
         dist_matrix = compute_geodesic_distances(self.vertices, self.faces)
-
-        #TODO convert to pointcloud here with the normals
         patches = {}
+        to_skip=[]
         for center_idx in range(len(self.vertices)):
+            if center_idx in to_skip:
+                skip=True
+            else:
+                skip=False
             pcd = o3d.geometry.PointCloud()
             # Find all vertices within geodesic radius n
             patch_mask = dist_matrix[center_idx] <= radius
+            if not skip:
+                to_skip.extend(np.where(dist_matrix[center_idx] <= filter_radius)[0].tolist())
+                to_skip=list(set(to_skip))
             patch_indices = np.where(patch_mask)[0]
             vertices = self.vertices[patch_indices]
             normals = self.normals[patch_indices]
@@ -238,8 +266,9 @@ class GeodesicPatcher:
                              vertices,
                              normals,
                              self.atom_ids[patch_indices],
-                             get_patch_residues(self.traj, self.atom_ids[patch_indices]))
+                             get_patch_residues(self.traj, self.atom_ids[patch_indices]),
+                             skip)
 
-        patches = ProteinPatches(self.pdb, patches, fpfh_radius, max_nn, radius)
+        patches = ProteinPatches(self.pdb, patches, filter_radius, fpfh_radius, max_nn, radius)
         return patches
 

@@ -3,6 +3,7 @@ channels:
   - bioconda
   - conda-forge
   - defaults
+  - nvidia
 dependencies:
   - cuda-toolkit
   - python=3.11
@@ -21,4 +22,4 @@ dependencies:
       - giotto-tda
       - scikit-learn
       - tqdm
-      
+      - geomloss 
