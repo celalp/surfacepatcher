@@ -263,12 +263,10 @@ class GeodesicPatcher:
                              patch_indices,
                              patch_features,
                              fpfh_features.data,
-                             vertices,
-                             normals,
                              self.atom_ids[patch_indices],
                              get_patch_residues(self.traj, self.atom_ids[patch_indices]),
                              skip)
 
-        patches = ProteinPatches(self.pdb, patches, filter_radius, fpfh_radius, max_nn, radius)
+        patches = ProteinPatches(self.pdb, patches, fpfh_radius, max_nn, radius, filter_radius, self.vertices, self.normals)
         return patches
 
