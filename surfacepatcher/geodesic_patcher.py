@@ -17,6 +17,8 @@ class ProteinPatch:
     biochem_features: dict
     fpfh_features: numpy.ndarray
     atom_ids: numpy.ndarray
+    vertices: numpy.ndarray
+    normals:numpy.ndarray
     residues: list
     skip:bool=False
 
@@ -79,6 +81,8 @@ class ProteinPatches:
                 max_nn=metadata['max_nn'],
                 patch_radius=metadata['patch_radius'],
                 filter_radius=metadata['filter_radius'],
+                vertices=metadata["vertices"],
+                normals=metadata["normals"],
                 shelve_path=shelve_path
             )
 
@@ -257,13 +261,15 @@ class GeodesicPatcher:
                 patch_features[prop_name] = prop_values[patch_indices]
 
             patches[center_idx] = \
-                ProteinPatch(center_idx,
-                             patch_indices,
-                             patch_features,
-                             fpfh_features.data,
-                             self.atom_ids[patch_indices],
-                             get_patch_residues(self.traj, self.atom_ids[patch_indices]),
-                             skip)
+                ProteinPatch(center=center_idx,
+                             indices=patch_indices,
+                             biochem_features=patch_features,
+                             fpfh_features=fpfh_features.data,
+                             atom_ids=self.atom_ids[patch_indices],
+                             vertices=vertices,
+                             normals=normals,
+                             residues=get_patch_residues(self.traj, self.atom_ids[patch_indices]),
+                             skip=skip)
 
         patches = ProteinPatches(self.pdb, patches, fpfh_radius, max_nn, radius, filter_radius, self.vertices, self.normals)
         return patches
