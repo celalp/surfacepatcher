@@ -11,6 +11,4 @@ test
 *.vert
 *.face
 *.idea*
-2s
-nsltp
-pr10
+pdbs

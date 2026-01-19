@@ -3,11 +3,14 @@ channels:
   - bioconda
   - conda-forge
   - defaults
+  - nvidia
 dependencies:
   - cuda-toolkit
   - python=3.11
   - msms
   - pdb2pqr
+  - apbs
+  - reduce
   - pip
   - pip:
       - torch
@@ -19,4 +22,4 @@ dependencies:
       - giotto-tda
       - scikit-learn
       - tqdm
-      
+      - geomloss 
